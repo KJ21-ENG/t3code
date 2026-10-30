@@ -5,11 +5,13 @@ import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
   EnvironmentId,
   type ModelSelection,
+  NodeId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2Subagent,
   type Project,
   ProjectId,
   ProviderDriverKind,
@@ -3625,6 +3627,125 @@ it.effect(
         Effect.provide(layerTest({ state, idleTimeoutMs: 1000, beforeUnload })),
         Effect.scoped,
       );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 detaching a thread unloads its native subagents but not its delegated children",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-detach-children",
+        });
+        const parentThreadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-detach-children-parent",
+          projectId,
+        });
+        const childThreadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-detach-children-child",
+          projectId,
+        });
+        const nativeChildThreadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-detach-children-native",
+          projectId,
+        });
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const providerThread = (threadId: ThreadId, nativeThreadId: string) =>
+          makeProviderThread({ idAllocator, threadId, providerSessionId, now, nativeThreadId });
+        const parentProviderThread = providerThread(parentThreadId, "native-parent");
+        const childProviderThread = providerThread(childThreadId, "native-delegated-child");
+        const nativeProviderThread = providerThread(nativeChildThreadId, "native-subagent");
+        const subagentEvent = (
+          origin: OrchestrationV2Subagent["origin"],
+          fixture: string,
+          thread: OrchestrationV2ProviderThread,
+          threadId: ThreadId,
+        ) =>
+          Effect.gen(function* () {
+            const id = NodeId.make(`node:${fixture}`);
+            return {
+              id: yield* idAllocator.allocate.event({ threadId: parentThreadId }),
+              type: "subagent.updated" as const,
+              threadId: parentThreadId,
+              nodeId: id,
+              driver: CODEX_DRIVER,
+              providerInstanceId: modelSelection.instanceId,
+              occurredAt: now,
+              payload: {
+                id,
+                threadId: parentThreadId,
+                runId: null,
+                parentNodeId: NodeId.make("node:parent"),
+                origin,
+                createdBy: "agent" as const,
+                driver: CODEX_DRIVER,
+                providerInstanceId: modelSelection.instanceId,
+                providerThreadId: thread.id,
+                childThreadId: threadId,
+                nativeTaskRef: null,
+                prompt: "",
+                title: null,
+                model: null,
+                status: "completed" as const,
+                result: null,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+              },
+            };
+          });
+        const providerThreadEvent = (threadId: ThreadId, payload: OrchestrationV2ProviderThread) =>
+          Effect.gen(function* () {
+            return {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated" as const,
+              threadId,
+              driver: CODEX_DRIVER,
+              occurredAt: now,
+              payload,
+            };
+          });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: parentThreadId, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: childThreadId, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: nativeChildThreadId, now }),
+            yield* providerThreadEvent(parentThreadId, parentProviderThread),
+            yield* providerThreadEvent(childThreadId, childProviderThread),
+            yield* providerThreadEvent(nativeChildThreadId, nativeProviderThread),
+            yield* subagentEvent("app_owned", "delegated", childProviderThread, childThreadId),
+            yield* subagentEvent(
+              "provider_native",
+              "native",
+              nativeProviderThread,
+              nativeChildThreadId,
+            ),
+          ],
+        });
+        yield* manager.open({
+          threadId: parentThreadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+
+        yield* manager.detach({ providerSessionId, threadId: parentThreadId });
+
+        assert.sameMembers(
+          [...(yield* Ref.get(state)).unloadedNativeThreadIds],
+          ["native-parent", "native-subagent"],
+        );
+      });
+
+      yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })), Effect.scoped);
     }),
 );
 

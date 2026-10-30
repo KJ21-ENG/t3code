@@ -14,6 +14,7 @@ import {
   type OrchestrationV2Command,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ShellSnapshot,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadShell,
   type PullRequestSummary,
   type ServerSettings as ContractServerSettings,
@@ -464,6 +465,10 @@ describe("autoSettlementSettingsKey", () => {
 });
 
 type AutoSettleCommand = Extract<OrchestrationV2Command, { readonly type: "thread.auto-settle" }>;
+type DelegatedTaskFixture = Pick<
+  OrchestrationV2Subagent,
+  "origin" | "childThreadId" | "remoteChild"
+>;
 
 const testCrypto = Crypto.make({
   randomBytes: (size) => new Uint8Array(size).fill(1),
@@ -562,6 +567,8 @@ interface HarnessOptions {
   ) => Effect.Effect<void>;
   readonly onCloseIdle?: () => Effect.Effect<void>;
   readonly currentThreads?: ReadonlyArray<OrchestrationV2AppThread>;
+  readonly subagentsByThread?: Readonly<Record<string, ReadonlyArray<DelegatedTaskFixture>>>;
+  readonly busyThreadIds?: ReadonlyArray<string>;
 }
 
 const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options: HarnessOptions) {
@@ -574,6 +581,7 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
   const settingsChanges = yield* PubSub.unbounded<ContractServerSettings>();
   const mergedPullRequests = yield* PubSub.unbounded<PullRequestService.PullRequestMergeEvent>();
   const commands = yield* Ref.make<ReadonlyArray<AutoSettleCommand>>([]);
+  const settledThreadIds = yield* Ref.make<ReadonlyArray<string>>([]);
   const branchCalls = yield* Ref.make<
     ReadonlyArray<{ readonly cwd: string; readonly branch: string }>
   >([]);
@@ -628,6 +636,13 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
     });
 
   const dispatch: Orchestrator.OrchestratorV2Shape["dispatch"] = (command) => {
+    if (command.type === "thread.settle") {
+      return options.busyThreadIds?.includes(command.threadId) === true
+        ? Effect.die(new Error(`Thread ${command.threadId} is still running.`))
+        : Ref.update(settledThreadIds, (recorded) => [...recorded, command.threadId]).pipe(
+            Effect.as({ sequence: 1, storedEvents: [] }),
+          );
+    }
     if (command.type !== "thread.auto-settle") {
       return Effect.die(new Error(`Unexpected command: ${command.type}`));
     }
@@ -672,6 +687,8 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
           ? Effect.succeed(thread)
           : Effect.die(new Error(`Unexpected thread read: ${threadId}`));
       },
+      getThreadRecords: (threadId) =>
+        Effect.succeed({ subagents: options.subagentsByThread?.[threadId] ?? [] } as never),
     }),
     Layer.mock(Orchestrator.OrchestratorV2)({
       streamDomainEvents: Stream.fromPubSub(domainEvents),
@@ -713,6 +730,7 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
     snapshotReads,
     candidateReads,
     commands,
+    settledThreadIds,
     branchCalls,
     summaryCalls,
     summaryRecovery,
@@ -1297,6 +1315,98 @@ describe("ThreadSettlementServiceV2 terminals", () => {
     occurredAt: DateTime.makeUnsafe(NOW),
     payload: thread,
   });
+  const delegatedChild = (
+    id: string,
+    parent: OrchestrationV2AppThread,
+    settledOverride: OrchestrationV2AppThread["settledOverride"] = null,
+    worktreePath: string | null = null,
+  ): OrchestrationV2AppThread => ({
+    ...appThread(id, settledOverride, worktreePath),
+    lineage: {
+      parentThreadId: parent.id,
+      relationshipToParent: "subagent",
+      rootThreadId: parent.id,
+    },
+  });
+  const appOwnedTask = (thread: OrchestrationV2AppThread): DelegatedTaskFixture => ({
+    origin: "app_owned",
+    childThreadId: thread.id,
+  });
+
+  it.effect("closes the delegated children still open when their parent closes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const settledParent = appThread("settled-parent", "settled");
+        const archivedParent = appThread("archived-parent", null);
+        const open = delegatedChild("open-child", settledParent);
+        const running = delegatedChild("running-child", settledParent);
+        const afterRunning = delegatedChild("after-running-child", settledParent);
+        const alreadySettled = delegatedChild("already-settled-child", settledParent, "settled");
+        const deleted = {
+          ...delegatedChild("deleted-child", settledParent),
+          deletedAt: DateTime.makeUnsafe(NOW),
+        };
+        const archived = {
+          ...delegatedChild("archived-child", settledParent),
+          archivedAt: DateTime.makeUnsafe(NOW),
+        };
+        const native = delegatedChild("native-child", settledParent);
+        const archivedParentChild = delegatedChild("archived-parent-child", archivedParent);
+        const marker = appThread("marker-thread", "settled");
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([]),
+          currentThreads: [
+            settledParent,
+            archivedParent,
+            open,
+            running,
+            afterRunning,
+            alreadySettled,
+            deleted,
+            archived,
+            native,
+            archivedParentChild,
+            marker,
+          ],
+          busyThreadIds: [running.id],
+          subagentsByThread: {
+            [settledParent.id]: [
+              appOwnedTask(open),
+              appOwnedTask(running),
+              appOwnedTask(afterRunning),
+              appOwnedTask(alreadySettled),
+              appOwnedTask(deleted),
+              appOwnedTask(archived),
+              { origin: "provider_native", childThreadId: native.id },
+              { origin: "app_owned", childThreadId: null },
+            ],
+            [archivedParent.id]: [appOwnedTask(archivedParentChild)],
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+          yield* fixture.publishEvent(settledEvent(settledParent));
+          yield* fixture.publishEvent({
+            type: "thread.archived",
+            id: EventId.make(`event:archived:${archivedParent.id}`),
+            threadId: archivedParent.id,
+            occurredAt: DateTime.makeUnsafe(NOW),
+            payload: archivedParent,
+          });
+          yield* fixture.publishEvent(settledEvent(marker));
+          yield* Queue.take(fixture.closedIdle);
+          assert.deepStrictEqual(yield* Queue.take(fixture.closedIdle), { threadId: marker.id });
+          assert.deepStrictEqual(yield* Ref.get(fixture.settledThreadIds), [
+            open.id,
+            afterRunning.id,
+            archivedParentChild.id,
+          ]);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
 
   it.effect("keeps the terminals of a thread re-engaged before the event ran", () =>
     Effect.scoped(
@@ -1326,10 +1436,22 @@ describe("ThreadSettlementServiceV2 terminals", () => {
         const shared = appThread("shared-checkout-thread", "settled");
         const missing = appThread("removed-worktree-thread", "settled", "/worktrees/removed");
         const worktree = appThread("worktree-thread", "settled", "/worktrees/thread");
+        const childInParentWorktree = delegatedChild(
+          "child-in-parent-worktree",
+          worktree,
+          "settled",
+          "/worktrees/thread",
+        );
+        const childInOwnWorktree = delegatedChild(
+          "child-in-own-worktree",
+          worktree,
+          "settled",
+          "/worktrees/child",
+        );
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([]),
-          currentThreads: [shared, missing, worktree],
-          existingWorktreePaths: ["/worktrees/thread"],
+          currentThreads: [shared, missing, worktree, childInParentWorktree, childInOwnWorktree],
+          existingWorktreePaths: ["/worktrees/thread", "/worktrees/child"],
         });
 
         yield* Effect.gen(function* () {
@@ -1337,11 +1459,16 @@ describe("ThreadSettlementServiceV2 terminals", () => {
           yield* startHarness(service, fixture.activation, fixture.snapshotReads);
           yield* fixture.publishEvent(settledEvent(shared));
           yield* fixture.publishEvent(settledEvent(missing));
+          yield* fixture.publishEvent(settledEvent(childInParentWorktree));
           yield* fixture.publishEvent(settledEvent(worktree));
+          yield* fixture.publishEvent(settledEvent(childInOwnWorktree));
           const run = yield* Queue.take(fixture.scriptRuns);
           assert.strictEqual(run.threadId, worktree.id);
           assert.strictEqual(run.worktreePath, "/worktrees/thread");
           assert.strictEqual(run.trigger, "settle");
+          const childRun = yield* Queue.take(fixture.scriptRuns);
+          assert.strictEqual(childRun.threadId, childInOwnWorktree.id);
+          assert.strictEqual(childRun.worktreePath, "/worktrees/child");
         }).pipe(Effect.provide(fixture.layer));
       }),
     ),

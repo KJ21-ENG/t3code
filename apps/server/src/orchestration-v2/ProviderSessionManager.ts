@@ -2403,12 +2403,25 @@ export const layerWithOptions = (
                 projectionStore.getThreadRecords(input.threadId, [
                   "providerThreads",
                   "providerTurns",
+                  "subagents",
                 ]),
               );
               if (Option.isSome(projection)) {
+                // Delegated children are threads of their own, still attached and in use here.
+                const delegatedProviderThreadIds = new Set(
+                  projection.value.subagents.flatMap((task) =>
+                    task.origin === "app_owned" && task.providerThreadId !== null
+                      ? [task.providerThreadId]
+                      : [],
+                  ),
+                );
                 const providerThreads = new Map(
                   projection.value.providerThreads
-                    .filter((thread) => thread.providerSessionId === input.providerSessionId)
+                    .filter(
+                      (thread) =>
+                        thread.providerSessionId === input.providerSessionId &&
+                        !delegatedProviderThreadIds.has(thread.id),
+                    )
                     .map((thread) => [thread.id, thread] as const),
                 );
                 detachedProviderThreads = [...providerThreads.values()];

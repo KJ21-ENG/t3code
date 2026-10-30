@@ -165,6 +165,10 @@ sending an answer or restarting the agent. Settling also closes the thread's
 terminals that wait at an idle prompt, and keeps their output. A terminal that
 runs a command, such as a dev server, stays open.
 
+Settling or archiving a thread also settles the tasks it delegated, except any still
+working. Their agents' helper processes, such as MCP servers, stop within about a minute
+on Codex. Send a task a new message to continue it; its helpers start again.
+
 To reclaim disk space from settled work, turn on **Run in the thread's worktree when the
 thread settles** for one of the project's actions, or set `"runOnSettle": true` on a
 `t3.json` script, for example `cargo clean`. It runs each time a thread in its own

@@ -565,17 +565,67 @@ export const make = Effect.gen(function* () {
       return sweepThread(threadId).pipe(FiberSet.run(threadSweeps), Effect.asVoid);
     });
 
+  const logCleanupFailure =
+    (message: string, threadId: ThreadId) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) => Effect.logWarning(message, { threadId, cause: Cause.pretty(cause) }),
+        ),
+      );
+
+  // Delegated children show under their parent, so closing the parent is the owner's only signal
+  // that their work is done. Settling detaches a child, which stops its provider's MCP processes;
+  // a later message to it re-engages it. A child still working keeps going and refuses here.
+  const settleDelegatedChildren = Effect.fn("ThreadSettlementServiceV2.settleDelegatedChildren")(
+    function* (threadId: ThreadId) {
+      const { subagents } = yield* projections.getThreadRecords(threadId, ["subagents"]);
+      for (const task of subagents) {
+        if (task.origin !== "app_owned" || task.childThreadId === null) continue;
+        const childThreadId = task.childThreadId;
+        yield* Effect.gen(function* () {
+          const child = yield* projections.getThread(childThreadId);
+          if (
+            child.settledOverride === "settled" ||
+            child.archivedAt !== null ||
+            child.deletedAt !== null
+          ) {
+            return;
+          }
+          const uuid = yield* crypto.randomUUIDv4();
+          yield* orchestrator.dispatch({
+            type: "thread.settle",
+            commandId: CommandId.make(`server:settle-delegated:${childThreadId}:${uuid}`),
+            threadId: childThreadId,
+          });
+        }).pipe(logCleanupFailure("settling a delegated child failed", childThreadId));
+      }
+    },
+    (effect, threadId) =>
+      effect.pipe(logCleanupFailure("reading delegated children failed", threadId)),
+  );
+
   // Skip settle scripts in shared checkouts where other threads may still work.
   const cleanUpSettledThread = Effect.fn("ThreadSettlementServiceV2.cleanUpSettledThread")(
     function* (threadId: ThreadId) {
       const settled = yield* projections.getThread(threadId);
       if (settled.settledOverride !== "settled") return;
       yield* terminals.closeIdle({ threadId });
+      yield* settleDelegatedChildren(threadId);
       const worktreePath = settled.worktreePath;
       if (worktreePath === null || !(yield* fileSystem.exists(worktreePath))) return;
       // Recheck after closing and worktree I/O; re-engaged threads must not be cleaned up.
       const thread = yield* projections.getThread(threadId);
       if (thread.settledOverride !== "settled") return;
+      // A delegated child in its parent's checkout leaves the settle script to the parent.
+      if (
+        thread.lineage.relationshipToParent === "subagent" &&
+        thread.lineage.parentThreadId !== null &&
+        (yield* projections.getThread(thread.lineage.parentThreadId)).worktreePath === worktreePath
+      ) {
+        return;
+      }
       const settledAtMs = toMillis(thread.settledAt);
       if (settledAtMs === null || settleActionRunAt.get(threadId) === settledAtMs) return;
       const run = yield* projectScripts.runForThread({
@@ -591,22 +641,15 @@ export const make = Effect.gen(function* () {
       }
     },
     (effect, threadId) =>
-      effect.pipe(
-        Effect.catchCauseIf(
-          (cause) => !Cause.hasInterruptsOnly(cause),
-          (cause) =>
-            Effect.logWarning("cleaning up a settled thread failed", {
-              threadId,
-              cause: Cause.pretty(cause),
-            }),
-        ),
-      ),
+      effect.pipe(logCleanupFailure("cleaning up a settled thread failed", threadId)),
   );
 
   const processEvent = (event: OrchestrationV2DomainEvent) => {
     switch (event.type) {
       case "thread.settled":
         return cleanUpSettledThread(event.threadId);
+      case "thread.archived":
+        return settleDelegatedChildren(event.threadId);
       case "thread.pull-request-link-updated":
       case "thread.pull-request-synced":
       case "provider-session.detached":
